@@ -66,12 +66,33 @@ import type { TermHit, TermRule } from '../../shared/model';
 import { sampleTermRules } from './sample';
 import { uid } from './uid';
 
-/** 撤销/重做历史承载正文、确认记录、批注与规范用语规则；快照独立于历史，不参与撤销 */
+/** 撤销/重做历史承载正文、歧义确认记录、批注与规范用语规则（逐帧） */
 interface DocState {
   doc: ClauseDocument;
   confirmed: Record<string, string>;
   annotations: Annotation[];
   termRules: TermRule[];
+}
+
+/**
+ * 审阅留痕：版本快照、问题基线、条款审签与例外处置。
+ * 这些记录本身不参与普通编辑的撤销；整份文档替换时按事务随文档整套切换。
+ */
+interface TraceState {
+  snapshots: DocSnapshot[];
+  issueBaselines: IssueBaseline[];
+  signoffs: ArticleSignoff[];
+  issueExceptions: IssueException[];
+}
+
+/**
+ * 历史帧：普通编辑产生同世界帧，按现有粒度撤销 / 重做；
+ * 整份文档替换（粘贴 / JSON 导入 / 载入示例）产生跨世界帧，
+ * 撤销 / 重做跨越世界边界时整套恢复目标世界的留痕与会话临时产物失效处理。
+ */
+interface HistoryFrame {
+  docState: DocState;
+  world: number;
 }
 
 interface Snapshot {
@@ -94,7 +115,7 @@ interface Snapshot {
   readingPackStale: boolean;
   /** 条款审签记录对当前正文的实时汇总（有效 / 待重签 / 未签 / 已删除） */
   signoffView: SignoffView;
-  /** 断链 / 自引用问题的例外处置记录（独立持久化，不进入撤销历史） */
+  /** 断链 / 自引用问题的例外处置记录（随当前世界持久化；整份替换事务整体切换） */
   issueExceptions: IssueException[];
   /** 例外处置记录对当前实时分析的逐条判定（已接受 / 待复核 / 已消失） */
   exceptionView: IssueExceptionEntry[];
@@ -105,14 +126,24 @@ interface Snapshot {
 const MAX_HISTORY = 100;
 
 export class AppStore {
-  private past: DocState[] = [];
-  private future: DocState[] = [];
+  private past: HistoryFrame[] = [];
+  private future: HistoryFrame[] = [];
   private docState: DocState;
+  /** 当前世界（整份文档替换开启新世界）的 id；首启文档为 0 */
+  private currentWorld = 0;
+  private nextWorldId = 1;
+  /**
+   * 各世界审阅留痕的权威存储：世界 id -> 留痕。
+   * 同一世界内签署 / 例外 / 快照等独立操作就地更新当前世界；
+   * 跨世界撤销 / 重做时整套换入目标世界留痕。当前世界对应的字段为镜像。
+   */
+  private worlds = new Map<number, TraceState>();
+  // —— 当前世界留痕镜像（与 worlds.get(currentWorld) 同步）——
   private snapshots: DocSnapshot[] = [];
   private issueBaselines: IssueBaseline[] = [];
-  /** 条款审签记录（独立于正文撤销历史；有效 / 待重签按当前条文实时重算） */
+  /** 条款审签记录（同世界内独立于正文撤销历史；有效 / 待重签按当前条文实时重算） */
   private signoffs: ArticleSignoff[] = [];
-  /** 断链 / 自引用问题的例外处置记录（独立于撤销历史；已接受 / 待复核 / 已消失按当前分析实时重算） */
+  /** 断链 / 自引用问题的例外处置记录（同世界内独立于撤销历史；三态按当前分析实时重算） */
   private issueExceptions: IssueException[] = [];
   private analysis: Analysis;
   /** 当前规范用语命中（随 docState 实时重算，不进入撤销历史） */
@@ -148,6 +179,13 @@ export class AppStore {
     this.docState = { doc, confirmed: initial.confirmed, annotations: relocated, termRules };
     this.analysis = analyze(doc, { confirmed: initial.confirmed });
     this.termHits = scanTerms(doc, termRules);
+    // 首启文档为初始世界，留痕整体归于该世界
+    this.worlds.set(0, {
+      snapshots: this.snapshots,
+      issueBaselines: this.issueBaselines,
+      signoffs: this.signoffs,
+      issueExceptions: this.issueExceptions,
+    });
   }
 
   subscribe = (cb: () => void): (() => void) => {
@@ -192,17 +230,54 @@ export class AppStore {
     };
   }
 
-  /** 提交新状态：重新分析、批注自动重定位、裁剪过期确认、规范用语重扫、压入历史、持久化 */
-  private commit(
+  /** 当前正文状态与所属世界构成的帧 */
+  private get currentFrame(): HistoryFrame {
+    return { docState: this.docState, world: this.currentWorld };
+  }
+
+  /** 当前世界留痕镜像 */
+  private currentTraces(): TraceState {
+    return {
+      snapshots: this.snapshots,
+      issueBaselines: this.issueBaselines,
+      signoffs: this.signoffs,
+      issueExceptions: this.issueExceptions,
+    };
+  }
+
+  /** 把当前留痕镜像同步回当前世界（独立留痕操作已就地更新镜像，替换 / 换世界前保存） */
+  private syncCurrentWorld(): void {
+    this.worlds.set(this.currentWorld, this.currentTraces());
+  }
+
+  /** 换入目标世界留痕：四套镜像整体替换 */
+  private applyTraces(traces: TraceState): void {
+    this.snapshots = traces.snapshots;
+    this.issueBaselines = traces.issueBaselines;
+    this.signoffs = traces.signoffs;
+    this.issueExceptions = traces.issueExceptions;
+  }
+
+  /** 回收历史栈中已不可达世界的留痕（当前世界保留） */
+  private gcWorlds(): void {
+    const reachable = new Set<number>([this.currentWorld]);
+    for (const f of this.past) reachable.add(f.world);
+    for (const f of this.future) reachable.add(f.world);
+    for (const id of [...this.worlds.keys()]) {
+      if (!reachable.has(id)) this.worlds.delete(id);
+    }
+  }
+
+  /**
+   * 提交前归一化：重新分析、批注自动重定位、裁剪过期确认、规范用语重扫。
+   * 返回归一化后的正文状态、实时分析、规范命中与本次转入待复核的批注数。
+   */
+  private normalizeDocState(
     next: DocState,
-    options: { coalesce?: boolean; structural?: boolean } = {},
-  ): void {
-    // 正文版本号：仅正文文档对象变化时递增（批注 / 规范规则 / 歧义确认提交不变更正文）
-    const docChanged = next.doc !== this.docState.doc;
+  ): { docState: DocState; analysis: Analysis; termHits: TermHit[]; reviewCount: number } {
     const analysis = analyze(next.doc, { confirmed: next.confirmed });
     // 批注按调整后的正文/结构自动重定位
     const relocated = relocateAnnotations(next.annotations, next.doc);
-    const annotations = relocated.annotations;
     // 裁剪：确认记录必须仍对应一个“歧义已消失/仍歧义”的 occurrence，且目标存在
     const valid = new Set(
       analysis.occurrences
@@ -213,30 +288,90 @@ export class AppStore {
     for (const [sig, target] of Object.entries(next.confirmed)) {
       if (valid.has(sig) && analysis.nodes[target]) confirmed[sig] = target;
     }
-    next = { confirmed, doc: touch(next.doc), annotations, termRules: next.termRules };
-    // 规范用语命中随正文 / 规则实时重扫
-    const termHits = scanTerms(next.doc, next.termRules);
+    const docState: DocState = {
+      confirmed,
+      doc: touch(next.doc),
+      annotations: relocated.annotations,
+      termRules: next.termRules,
+    };
+    return {
+      docState,
+      analysis,
+      termHits: scanTerms(docState.doc, docState.termRules),
+      reviewCount: relocated.reviewIds.length,
+    };
+  }
+
+  /** 提交新状态：压入历史（同世界帧）、持久化 */
+  private commit(
+    next: DocState,
+    options: { coalesce?: boolean; structural?: boolean } = {},
+  ): void {
+    // 正文版本号：仅正文文档对象变化时递增（批注 / 规范规则 / 歧义确认提交不变更正文）
+    const docChanged = next.doc !== this.docState.doc;
+    const norm = this.normalizeDocState(next);
 
     if (options.coalesce) {
       if (this.coalesceBaseline) {
         // 同一编辑突发内：不压栈，栈顶保持为突发前基线
       } else {
         this.coalesceBaseline = this.docState;
-        this.past.push(this.docState);
+        this.past.push(this.currentFrame);
       }
     } else {
       this.coalesceBaseline = null;
       this.editCoalesceUntil = 0;
       this.ruleCoalesceUntil = 0;
-      this.past.push(this.docState);
+      this.past.push(this.currentFrame);
       if (this.past.length > MAX_HISTORY) this.past.shift();
+      this.gcWorlds();
     }
     this.future = [];
-    this.docState = next;
+    this.docState = norm.docState;
     if (docChanged) this.docRevision += 1;
-    this.analysis = analysis;
-    this.termHits = termHits;
-    this.lastAnnotationReviewCount = options.structural ? relocated.reviewIds.length : 0;
+    this.analysis = norm.analysis;
+    this.termHits = norm.termHits;
+    this.lastAnnotationReviewCount = options.structural ? norm.reviewCount : 0;
+    this.scheduleSave();
+    this.emit();
+  }
+
+  /**
+   * 整份文档替换事务：粘贴替换 / JSON 导入 / 载入示例统一入口。
+   * 替换前状态（含当前世界留痕）作为一帧留在 past 栈底侧，替换后状态作为
+   * 新世界的当前帧；撤销整体恢复替换前正文、歧义确认、批注、规范用语规则与
+   * 对应留痕，重做恢复替换后的整套状态。替换后若再做普通编辑，仍按现有粒度撤销。
+   * 基于旧正文 / 旧确认的会话临时产物（修订预演、引用阅读包）一律失效清空。
+   */
+  private commitReplacement(next: DocState, nextTraces: TraceState): void {
+    const norm = this.normalizeDocState(next);
+    const newWorld = this.nextWorldId++;
+
+    // 压栈前先把当前世界最新留痕定格到帧侧：此后（含本次切换本身）
+    // 对当前留痕字段的写入不会经由 worlds 反向覆盖栈帧里的旧世界留痕
+    this.syncCurrentWorld();
+
+    this.coalesceBaseline = null;
+    this.editCoalesceUntil = 0;
+    this.ruleCoalesceUntil = 0;
+    this.past.push(this.currentFrame);
+    if (this.past.length > MAX_HISTORY) this.past.shift();
+    this.future = [];
+
+    this.currentWorld = newWorld;
+    this.applyTraces(nextTraces);
+    this.worlds.set(newWorld, this.currentTraces());
+
+    // 正文版本号：整份替换一定视作正文变化（即便新旧文档对象恰为同一引用）
+    this.docRevision += 1;
+    this.docState = norm.docState;
+    this.analysis = norm.analysis;
+    this.termHits = norm.termHits;
+    this.lastAnnotationReviewCount = 0;
+    // 旧文档的会话临时产物对新文档无意义，禁止再应用 / 复制
+    this.sandbox = null;
+    this.readingPack = null;
+    this.gcWorlds();
     this.scheduleSave();
     this.emit();
   }
@@ -251,38 +386,60 @@ export class AppStore {
 
   // ---------- 历史 ----------
 
-  undo(): void {
-    const prev = this.past.pop();
-    if (!prev) return;
-    if (prev.doc !== this.docState.doc) this.docRevision += 1;
-    this.future.push(this.docState);
-    this.docState = prev;
-    this.analysis = analyze(prev.doc, { confirmed: prev.confirmed });
-    this.termHits = scanTerms(prev.doc, prev.termRules);
+  /**
+   * 换入历史帧：重算分析与规范命中；跨越整份文档替换的世界边界时，
+   * 保存离开世界的最新留痕、整体换入目标世界留痕，并失效旧文档的
+   * 修订预演与引用阅读包（不可再应用 / 复制）。
+   */
+  private activateFrame(frame: HistoryFrame, leaving: 'past' | 'future'): void {
+    const switching = frame.world !== this.currentWorld;
+    if (switching) this.syncCurrentWorld();
+    if (leaving === 'past') {
+      this.future.push(this.currentFrame);
+      this.past.pop();
+    } else {
+      this.past.push(this.currentFrame);
+      this.future.pop();
+    }
+
+    const prevDoc = this.docState.doc;
+    this.currentWorld = frame.world;
+    if (switching) {
+      const traces = this.worlds.get(frame.world) ?? {
+        snapshots: [],
+        issueBaselines: [],
+        signoffs: [],
+        issueExceptions: [],
+      };
+      this.applyTraces(traces);
+      // 跨文档撤销 / 重做：旧文档的预演与阅读包失效，不能应用或复制
+      this.sandbox = null;
+      this.readingPack = null;
+    }
+    this.docState = frame.docState;
+    if (frame.docState.doc !== prevDoc) this.docRevision += 1;
+    this.analysis = analyze(frame.docState.doc, { confirmed: frame.docState.confirmed });
+    this.termHits = scanTerms(frame.docState.doc, frame.docState.termRules);
     this.coalesceBaseline = null;
     this.editCoalesceUntil = 0;
     this.ruleCoalesceUntil = 0;
     this.lastAnnotationReviewCount = 0;
     this.lastTermReplace = null;
+    if (switching) this.gcWorlds();
     this.scheduleSave();
     this.emit();
   }
 
+  undo(): void {
+    const prev = this.past[this.past.length - 1];
+    if (!prev) return;
+    this.activateFrame(prev, 'past');
+  }
+
   redo(): void {
-    const next = this.future.pop();
+    const next = this.future[this.future.length - 1];
     if (!next) return;
-    if (next.doc !== this.docState.doc) this.docRevision += 1;
-    this.past.push(this.docState);
-    this.docState = next;
-    this.analysis = analyze(next.doc, { confirmed: next.confirmed });
-    this.termHits = scanTerms(next.doc, next.termRules);
-    this.coalesceBaseline = null;
-    this.editCoalesceUntil = 0;
-    this.ruleCoalesceUntil = 0;
-    this.lastAnnotationReviewCount = 0;
-    this.lastTermReplace = null;
-    this.scheduleSave();
-    this.emit();
+    this.activateFrame(next, 'future');
   }
 
   // ---------- 文档内容编辑（带 600ms 合并窗口） ----------
@@ -418,16 +575,18 @@ export class AppStore {
 
   importPastedText(raw: string): void {
     const { doc } = parseDocument(raw, this.docState.doc.title);
-    // 粘贴替换正文是全新文档，旧快照、问题基线、审签与批注不再有对齐意义；规范用语规则是用户词表，予以保留
-    this.snapshots = [];
-    this.issueBaselines = [];
-    this.signoffs = [];
-    // 例外处置绑定旧文档的稳定问题身份，新文档下一并清空
-    this.issueExceptions = [];
-    // 会话内临时产物（沙盒预演、引用阅读包）基于旧正文，新文档下一律清空
-    this.sandbox = null;
-    this.readingPack = null;
-    this.commit({ doc, confirmed: {}, annotations: [], termRules: this.docState.termRules });
+    // 粘贴替换正文是全新文档（新世界）：旧快照、问题基线、审签、批注与例外处置
+    // 不跨文档携带，但作为事务留在历史中，撤销时整套恢复；规范用语规则是用户词表，予以保留
+    const nextTraces: TraceState = {
+      snapshots: [],
+      issueBaselines: [],
+      signoffs: [],
+      issueExceptions: [],
+    };
+    this.commitReplacement(
+      { doc, confirmed: {}, annotations: [], termRules: this.docState.termRules },
+      nextTraces,
+    );
   }
 
   importJson(bundle: ExportBundle | PersistedState): void {
@@ -440,19 +599,23 @@ export class AppStore {
     };
     const confirmed = bundle.confirmed ?? {};
     // 快照随 JSON 导入；旧文件缺少 snapshots 时按空列表加载
-    this.snapshots = sanitizeSnapshots(bundle.snapshots);
+    const snapshots = sanitizeSnapshots(bundle.snapshots);
     // 问题基线随 JSON 导入（重新分析重建问题身份）；旧文件缺少 issueBaselines 时按空列表加载
-    this.issueBaselines = sanitizeIssueBaselines(bundle.issueBaselines);
+    const issueBaselines = sanitizeIssueBaselines(bundle.issueBaselines);
     // 批注随 JSON 导入并按导入后的正文重定位；旧文件缺少 annotations 时为空
     const annotations = sanitizeAnnotations(bundle.annotations);
     // 规范用语规则随 JSON 导入；旧文件缺少 termRules 时按空规则加载
     const termRules = sanitizeTermRules(bundle.termRules);
     // 审签记录随 JSON 导入；旧文件缺少 signoffs 时按空列表加载，有效 / 待重签按导入正文实时重算
-    this.signoffs = sanitizeSignoffs(bundle.signoffs);
-    // 例外处置记录随 JSON 导入；旧文件缺少 issueExceptions 时按空列表加载，已接受 / 待复核 / 已消失按导入正文实时重算
-    this.issueExceptions = sanitizeIssueExceptions(bundle.issueExceptions);
+    const signoffs = sanitizeSignoffs(bundle.signoffs);
+    // 例外处置记录随 JSON 导入；旧文件缺少 issueExceptions 时按空列表加载，三态按导入正文实时重算
+    const issueExceptions = sanitizeIssueExceptions(bundle.issueExceptions);
     renumberAll(doc.root);
-    this.commit({ doc: touch(doc), confirmed, annotations, termRules });
+    // 导入包的整套状态作为新世界事务：撤销恢复导入前文档及其留痕，重做恢复导入后整套状态
+    this.commitReplacement(
+      { doc: touch(doc), confirmed, annotations, termRules },
+      { snapshots, issueBaselines, signoffs, issueExceptions },
+    );
   }
 
   exportJson(): ExportBundle {
@@ -472,19 +635,22 @@ export class AppStore {
   }
 
   replaceWithSample(doc: ClauseDocument): void {
-    this.snapshots = [];
-    this.issueBaselines = [];
-    // 内置示例为全新文档，旧审签记录不再适用
-    this.signoffs = [];
-    // 例外处置绑定旧文档的稳定问题身份，内置示例下一并清空
-    this.issueExceptions = [];
-    // 内置示例自带示例规则（见 sampleTermRules），同时保留用户已维护的词表
-    this.commit({
-      doc,
-      confirmed: {},
-      annotations: [],
-      termRules: [...sampleTermRules(), ...this.docState.termRules],
-    });
+    // 内置示例为全新文档（新世界）：旧快照、问题基线、审签与例外处置不跨文档携带，
+    // 但作为事务留在历史中，撤销时整套恢复；示例自带示例规则，同时保留用户已维护的词表
+    this.commitReplacement(
+      {
+        doc,
+        confirmed: {},
+        annotations: [],
+        termRules: [...sampleTermRules(), ...this.docState.termRules],
+      },
+      {
+        snapshots: [],
+        issueBaselines: [],
+        signoffs: [],
+        issueExceptions: [],
+      },
+    );
   }
 
   // ---------- 版本快照（只读；创建/删除不进入正文撤销历史） ----------

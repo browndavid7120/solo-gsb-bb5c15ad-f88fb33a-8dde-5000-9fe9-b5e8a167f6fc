@@ -54,6 +54,7 @@ import {
 } from '../src/lib/exception';
 import { findReferencePath } from '../src/lib/pathfind';
 import { boundaryOffset, linearText, type SeqNodeAdapter } from '../src/lib/selection';
+import { sampleDocument } from '../src/lib/sample';
 let pass = 0;
 let fail = 0;
 function check(name: string, cond: boolean, extra = '') {
@@ -2570,6 +2571,252 @@ check('闭区间为每个目标建边', combA.edges.filter((e) => e.refKey === r
   const pureJson = JSON.stringify(pureA);
   findReferencePath(pureA, pfDoc.root[0].id, pfDoc.root[3].id);
   check('路径核对：不修改传入分析', JSON.stringify(pureA) === pureJson);
+}
+
+// ---- 整份文档替换事务：撤销恢复替换前整套状态、重做恢复替换后整套状态；跨文档临时产物失效 ----
+{
+  const txTextA = `替换法甲
+
+第一条
+参见第三条。
+
+第二条
+参见第三条。`;
+  const txTextB = `替换法乙
+
+第一条【总则】
+本条引用不存在的第九条，属于断链。
+
+第二条
+普通条文。`;
+  const mkTxDocA = () => parseDocument(txTextA).doc;
+
+  // —— 粘贴替换：旧留痕不随替换呈现，但撤销整套恢复 ——
+  const store = new AppStore({ doc: mkTxDocA(), confirmed: {}, annotations: [] });
+  const docA = store.getSnapshot().doc;
+  const artA1 = docA.root[0].id;
+  const parA1 = docA.root[0].children[0].id;
+  const brokenInA = store.getSnapshot().analysis.issues.find((i) => i.type === 'broken')!;
+  // 替换前世界：签署、例外处置、快照、问题基线、批注、规则各留一份痕迹
+  check('事务：替换前签署成功', store.signArticle(artA1, '甲签人').ok === true);
+  check('事务：替换前接受例外成功', store.acceptIssueException(brokenInA.identity, '旧文档例外理由').ok === true);
+  const snapAId = store.saveSnapshot('甲快照');
+  const baseAId = store.saveIssueBaseline('甲基线');
+  const annAId = store.addAnnotation(parA1, 0, 2, '甲批注');
+  const ruleAId = store.addTermRule();
+  store.updateTermRule(ruleAId, { canonical: '依照', variants: ['按照'] }, true);
+  check('事务：替换前四套留痕齐备', (() => {
+    const s = store.getSnapshot();
+    return s.snapshots.length === 1 && s.issueBaselines.length === 1 &&
+      s.signoffView.counts.valid === 1 && s.issueExceptions.length === 1 &&
+      s.annotations.length === 1 && s.termRules.length === 1;
+  })());
+
+  store.importPastedText(txTextB);
+  {
+    const s = store.getSnapshot();
+    check('事务：粘贴后正文为乙文档', s.doc.title === '替换法乙' && s.doc.root.length === 2, s.doc.title);
+    check('事务：粘贴后四套留痕清空', s.snapshots.length === 0 && s.issueBaselines.length === 0 &&
+      s.issueExceptions.length === 0 && s.signoffView.counts.total === 2 && s.signoffView.counts.unsigned === 2 &&
+      s.signoffView.deleted.length === 0);
+    check('事务：粘贴后批注 / 确认清空', s.annotations.length === 0 && Object.keys(s.confirmed).length === 0);
+    check('事务：用户词表跨粘贴保留', s.termRules.length === 1 && s.termRules[0].id === ruleAId);
+  }
+
+  // 撤销整份替换：旧正文与同一文档的旧留痕并存，且没有乙文档留痕串入
+  store.undo();
+  {
+    const s = store.getSnapshot();
+    check('事务：撤销恢复甲正文', s.doc.title === '替换法甲' && s.doc.root[0].id === artA1, s.doc.title);
+    check('事务：撤销恢复快照 / 基线', s.snapshots.some((x) => x.id === snapAId) && s.issueBaselines.some((x) => x.id === baseAId));
+    check('事务：撤销恢复批注 / 规则', s.annotations.some((a) => a.id === annAId) && s.termRules.some((r) => r.id === ruleAId));
+    check('事务：撤销恢复审签且按旧条文判有效', s.signoffView.counts.valid === 1 && s.signoffView.deleted.length === 0, JSON.stringify(s.signoffView.counts));
+    const ev = store.getExceptionView();
+    check('事务：撤销恢复例外处置记录', ev.length === 1 && ev[0].record.reason === '旧文档例外理由' && ev[0].status === 'accepted');
+    check('事务：撤销后无乙文档串入的记录', s.issueExceptions.every((r) => r.identity === brokenInA.identity));
+  }
+
+  // 重做：恢复替换后整套状态（乙正文 + 乙世界留痕：全空）
+  store.redo();
+  {
+    const s = store.getSnapshot();
+    check('事务：重做恢复乙正文', s.doc.title === '替换法乙');
+    check('事务：重做恢复乙世界留痕（空）', s.snapshots.length === 0 && s.issueBaselines.length === 0 &&
+      s.issueExceptions.length === 0 && s.annotations.length === 0 && s.signoffView.deleted.length === 0);
+    check('事务：重做后词表仍保留', s.termRules.length === 1 && s.termRules[0].id === ruleAId);
+  }
+  store.undo();
+
+  // —— 替换后在乙世界新增的留痕，撤销回甲后不可见；重做回乙后原样恢复 ——
+  store.redo();
+  const docB = store.getSnapshot().doc;
+  const artB1 = docB.root[0].id;
+  const brokenInB = store.getSnapshot().analysis.issues.find((i) => i.type === 'broken')!;
+  check('事务：乙世界签署成功', store.signArticle(artB1, '乙签人').ok === true);
+  check('事务：乙世界接受例外成功', store.acceptIssueException(brokenInB.identity, '新文档例外理由').ok === true);
+  const snapBId = store.saveSnapshot('乙快照');
+  store.undo();
+  {
+    const s = store.getSnapshot();
+    check('事务：撤销回甲后乙世界新增留痕不可见', s.doc.title === '替换法甲' &&
+      !s.snapshots.some((x) => x.id === snapBId) &&
+      !s.issueExceptions.some((r) => r.reason === '新文档例外理由') &&
+      s.signoffView.counts.total === 2 && s.signoffView.counts.valid === 1, JSON.stringify(s.signoffView.counts));
+    check('事务：甲世界原有留痕仍在', s.snapshots.some((x) => x.id === snapAId) &&
+      s.issueExceptions.some((r) => r.reason === '旧文档例外理由'));
+  }
+  store.redo();
+  {
+    const s = store.getSnapshot();
+    check('事务：重做回乙后乙世界新增留痕恢复', s.doc.title === '替换法乙' &&
+      s.snapshots.some((x) => x.id === snapBId) &&
+      s.issueExceptions.some((r) => r.reason === '新文档例外理由') &&
+      s.signoffView.counts.valid === 1);
+    check('事务：重做回乙后甲留痕不串入', !s.snapshots.some((x) => x.id === snapAId) &&
+      !s.issueExceptions.some((r) => r.reason === '旧文档例外理由'));
+  }
+
+  // —— JSON 导入：导入包整套状态随事务切换，撤销恢复导入前状态 ——
+  const bundle = store.exportJson();
+  const imp = new AppStore({ doc: mkTxDocA(), confirmed: {}, annotations: [] });
+  const impArt1 = imp.getSnapshot().doc.root[0].id;
+  check('事务：导入前签署一份', imp.signArticle(impArt1, '导入前签人').ok === true);
+  imp.importJson(bundle);
+  {
+    const s = imp.getSnapshot();
+    check('事务：JSON 导入后为乙正文', s.doc.title === '替换法乙');
+    check('事务：JSON 导入恢复包内审签', s.signoffView.counts.valid === 1 && s.signoffView.entries[0].signoff?.signer === '乙签人');
+    check('事务：JSON 导入恢复包内快照 / 例外 / 批注', s.snapshots.some((x) => x.id === snapBId) &&
+      s.issueExceptions.some((r) => r.reason === '新文档例外理由'));
+  }
+  imp.undo();
+  {
+    const s = imp.getSnapshot();
+    check('事务：撤销 JSON 导入恢复导入前正文', s.doc.title === '替换法甲' && s.doc.root[0].id === impArt1, s.doc.title);
+    check('事务：撤销 JSON 导入恢复导入前审签', s.signoffView.counts.valid === 1 &&
+      s.signoffView.entries[0].signoff?.signer === '导入前签人', JSON.stringify(s.signoffView.entries.map((e) => e.signoff?.signer)));
+    check('事务：撤销导入后包内留痕不串入', !s.snapshots.some((x) => x.id === snapBId) &&
+      !s.issueExceptions.some((r) => r.reason === '新文档例外理由'));
+  }
+  imp.redo();
+  check('事务：重做 JSON 导入再次恢复包内状态', imp.getSnapshot().doc.title === '替换法乙' &&
+    imp.getSnapshot().signoffView.entries[0].signoff?.signer === '乙签人');
+
+  // —— 导出包内快照为只读冻结对象，再次导入不得因规范化写 ordinal 而报错 ——
+  {
+    const frozenBundle = store.exportJson();
+    check('事务：导出包快照已冻结', Object.isFrozen(frozenBundle.snapshots![0].doc.root[0]));
+    const reimp = new AppStore({ doc: mkTxDocA(), confirmed: {}, annotations: [] });
+    let importOk = true;
+    try {
+      reimp.importJson(frozenBundle);
+    } catch {
+      importOk = false;
+    }
+    check('事务：冻结快照往返导入不报错且可撤销', importOk && reimp.getSnapshot().doc.title === '替换法乙');
+    reimp.undo();
+    check('事务：冻结快照导入事务可撤销回原文档', reimp.getSnapshot().doc.title === '替换法甲');
+  }
+
+  // —— 载入示例：同样为单步事务，且旧预演 / 阅读包失效 ——
+  imp.replaceWithSample(sampleDocument());
+  check('事务：载入示例后为示例文档', imp.getSnapshot().doc.root.length > 2);
+  check('事务：载入示例留痕清空', imp.getSnapshot().snapshots.length === 0 &&
+    imp.getSnapshot().issueExceptions.length === 0 && imp.getSnapshot().signoffView.deleted.length === 0);
+  imp.undo();
+  check('事务：撤销示例恢复导入的乙文档与留痕', imp.getSnapshot().doc.title === '替换法乙' &&
+    imp.getSnapshot().issueExceptions.some((r) => r.reason === '新文档例外理由'));
+  imp.redo();
+  check('事务：重做示例恢复示例文档', imp.getSnapshot().doc.title === sampleDocument().title);
+  imp.undo();
+
+  // —— 跨文档撤销 / 重做：旧修订预演与引用阅读包失效，不能应用或复制 ——
+  const epStore = new AppStore({ doc: mkTxDocA(), confirmed: {}, annotations: [] });
+  epStore.importPastedText(txTextB);
+  const epArt1 = epStore.getSnapshot().doc.root[0].id;
+  check('事务：乙文档生成预演成功', epStore.runSandboxPreview({ kind: 'delete', articleId: epArt1 }).ok === true);
+  check('事务：乙文档生成阅读包成功', epStore.generateReadingPack(epArt1).ok === true);
+  epStore.undo();
+  check('事务：跨文档撤销后预演失效清空', epStore.getSnapshot().sandbox === null);
+  check('事务：跨文档撤销后阅读包失效清空', epStore.getSnapshot().readingPack === null);
+  check('事务：跨文档撤销后禁止应用旧预演', epStore.applySandboxPreview() === false);
+  epStore.redo();
+  check('事务：跨文档重做后旧预演仍不可用', epStore.getSnapshot().sandbox === null &&
+    epStore.applySandboxPreview() === false);
+  check('事务：跨文档重做后旧阅读包不可复制', epStore.getSnapshot().readingPack === null);
+
+  // —— 替换后的普通编辑仍按现有粒度撤销（一次编辑一步，不跨文档）——
+  const grStore = new AppStore({ doc: mkTxDocA(), confirmed: {}, annotations: [] });
+  grStore.importPastedText(txTextB);
+  const grArt2 = grStore.getSnapshot().doc.root[1].id;
+  const grParId = grStore.getSnapshot().doc.root[1].children[0].id;
+  const grBefore = grStore.getSnapshot().doc.root[1].children[0].text;
+  grStore.updateNodeText(grParId, '替换后新增的正文。');
+  grStore.updateNodeText(grArt2, '结构无关编辑。');
+  grStore.undo();
+  check('事务：替换后编辑按粒度撤销（仅撤销第二步编辑）',
+    grStore.getSnapshot().doc.root[1].children[0].text === '替换后新增的正文。' &&
+    grStore.getSnapshot().doc.title === '替换法乙');
+  grStore.undo();
+  check('事务：再次撤销回到刚替换状态（仍是乙文档）',
+    grStore.getSnapshot().doc.root[1].children[0].text === grBefore &&
+    grStore.getSnapshot().doc.title === '替换法乙');
+  grStore.undo();
+  check('事务：第三次撤销才跨过事务恢复甲文档', grStore.getSnapshot().doc.title === '替换法甲');
+
+  // —— 持久化与 JSON 导出始终反映当前一致状态 ——
+  const psStore = new AppStore({ doc: mkTxDocA(), confirmed: {}, annotations: [] });
+  const psArt1 = psStore.getSnapshot().doc.root[0].id;
+  check('事务：甲世界签署', psStore.signArticle(psArt1, '持久签人').ok === true);
+  psStore.importPastedText(txTextB);
+  {
+    const ex = psStore.exportJson();
+    check('事务：导出始终反映替换后状态（无甲留痕）', ex.document.title === '替换法乙' &&
+      (ex.signoffs ?? []).length === 0 && (ex.issueExceptions ?? []).length === 0 &&
+      (ex.snapshots ?? []).length === 0);
+  }
+  psStore.undo();
+  {
+    const ex = psStore.exportJson();
+    check('事务：撤销后导出恢复甲状态', ex.document.title === '替换法甲' &&
+      (ex.signoffs ?? []).some((r) => r.signer === '持久签人'));
+  }
+
+  // —— localStorage 持久化：撤销 / 重做后自动保存的状态可原样重载，历史不留存旧世界串味 ——
+  {
+    const mem = new Map<string, string>();
+    (globalThis as { localStorage?: Storage }).localStorage = {
+      getItem: (k: string) => (mem.has(k) ? mem.get(k)! : null),
+      setItem: (k: string, v: string) => void mem.set(k, v),
+      removeItem: (k: string) => void mem.delete(k),
+      clear: () => mem.clear(),
+      key: (i: number) => [...mem.keys()][i] ?? null,
+      get length() {
+        return mem.size;
+      },
+    } as Storage;
+    // 动态加载使模块内 localStorage 引用拿到上面的 mock
+    const { AppStore: LSStore } = await import('../src/lib/store');
+    const { localStore } = await import('../src/lib/storage');
+    const ls = new LSStore({ doc: mkTxDocA(), confirmed: {}, annotations: [] });
+    const lsArt = ls.getSnapshot().doc.root[0].id;
+    ls.signArticle(lsArt, '本地签人');
+    ls.importPastedText(txTextB);
+    const savedB = localStore.load()!;
+    check('事务：替换后本地保存为乙文档且无甲留痕', savedB.doc.title === '替换法乙' &&
+      (savedB.signoffs ?? []).length === 0);
+    ls.undo();
+    const savedA = localStore.load()!;
+    check('事务：撤销后本地保存恢复甲文档与审签', savedA.doc.title === '替换法甲' &&
+      (savedA.signoffs ?? []).some((r) => r.signer === '本地签人') &&
+      (savedA.issueExceptions ?? []).length === 0);
+    // 从保存状态重载：新 store 干净一致（历史本身不持久化）
+    const reloaded = new LSStore(savedA);
+    const rs = reloaded.getSnapshot();
+    check('事务：重载后正文与留痕一致', rs.doc.title === '替换法甲' &&
+      rs.signoffView.counts.valid === 1 && rs.canUndo === false);
+    delete (globalThis as { localStorage?: Storage }).localStorage;
+  }
 }
 
 console.log(`\n通过 ${pass} 项，失败 ${fail} 项`);

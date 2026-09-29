@@ -72,10 +72,11 @@ export function sanitizeSnapshots(value: unknown): DocSnapshot[] {
     if (!raw || typeof raw !== 'object') continue;
     const s = raw as Partial<DocSnapshot>;
     if (!s.doc || !Array.isArray(s.doc.root) || typeof s.doc.title !== 'string') continue;
+    // 深拷贝后再规范化：导入往返（含本应用导出的只读冻结快照）不能因冻结 / 共享引用写坏
     const doc: ClauseDocument = {
       id: typeof s.doc.id === 'string' ? s.doc.id : uid('doc'),
       title: s.doc.title,
-      root: s.doc.root,
+      root: deepClone(s.doc.root),
       updatedAt: typeof s.doc.updatedAt === 'number' ? s.doc.updatedAt : 0,
     };
     renumberAll(doc.root);
