@@ -20,6 +20,7 @@ import {
   isHitCurrent,
 } from '../src/lib/terminology';
 import { AppStore } from '../src/lib/store';
+import { sampleDocument } from '../src/lib/sample';
 import {
   createIssueBaseline,
   sanitizeIssueBaselines,
@@ -2570,6 +2571,309 @@ check('闭区间为每个目标建边', combA.edges.filter((e) => e.refKey === r
   const pureJson = JSON.stringify(pureA);
   findReferencePath(pureA, pfDoc.root[0].id, pfDoc.root[3].id);
   check('路径核对：不修改传入分析', JSON.stringify(pureA) === pureJson);
+}
+
+// ---- 整份文档替换事务：粘贴 / JSON 导入 / 载入示例的撤销 / 重做整体恢复正文与留痕 ----
+{
+  const oldText = `旧文档办法
+
+第一条
+旧第一条引用第九条，明显断链。
+
+第二条
+本款就是本款。
+
+第三条
+旧第三条内容。`;
+  const oldDoc = parseDocument(oldText).doc;
+  renumberAll(oldDoc.root);
+  const oldRules = sanitizeTermRules([{ id: 'old-rule', canonical: '依照', variants: ['按照'] }]);
+  const store = new AppStore({
+    doc: oldDoc,
+    confirmed: {},
+    annotations: [],
+    termRules: oldRules,
+  });
+  const oldArt1 = oldDoc.root[0].id;
+  const oldArt2 = oldDoc.root[1].id;
+  const oldArt3 = oldDoc.root[2].id;
+
+  // 旧文档留痕：快照、问题基线、审签、例外处置；批注与歧义确认
+  store.saveSnapshot('旧快照');
+  store.saveIssueBaseline('旧基线');
+  const oldPar2 = oldDoc.root[1].children[0];
+  const annId = store.addAnnotation(oldPar2.id, 0, 2, oldPar2.text.slice(0, 2))!;
+  check('替换事务：旧批注已建', Boolean(annId) && store.getSnapshot().annotations.length === 1);
+  const signRes = store.signArticle(oldArt3, '旧审签人');
+  check('替换事务：旧审签已签', signRes.ok && store.getSignoffView().counts.valid === 1);
+  const oldBroken = store.getSnapshot().analysis.issues.find((i) => i.type === 'broken')!;
+  check('替换事务：旧文档存在断链', Boolean(oldBroken));
+  check(
+    '替换事务：旧例外已接受',
+    store.acceptIssueException(oldBroken.identity, '旧文档接受理由').ok,
+  );
+  check(
+    '替换事务：旧留痕齐备',
+    store.getSnapshot().snapshots.length === 1 &&
+      store.getSnapshot().issueBaselines.length === 1 &&
+      store.getSnapshot().issueExceptions.length === 1,
+  );
+  // 替换前再做一次普通正文编辑，验证替换后仍按粒度撤销、留痕随时代整体切换
+  store.updateNodeText(oldDoc.root[2].children[0].id, '旧第三条被改写。');
+  const oldSidesJson = JSON.stringify({
+    snapshots: store.getSnapshot().snapshots,
+    issueBaselines: store.getSnapshot().issueBaselines,
+    issueExceptions: store.getSnapshot().issueExceptions,
+  });
+
+  const newText = `新文档办法
+
+第一条
+新第一条引用第二条。
+
+第二条
+新第二条内容。`;
+  const newDocParsed = parseDocument(newText).doc;
+  const newArt1Id = newDocParsed.root[0].id;
+
+  // —— 粘贴替换：一次完整历史事务 ——
+  store.importPastedText(newText);
+  const afterPaste = store.getSnapshot();
+  check('替换事务：粘贴后为新正文', afterPaste.doc.title === '新文档办法' && afterPaste.doc.root.length === 2);
+  check('替换事务：粘贴后旧留痕全部清空', afterPaste.snapshots.length === 0 &&
+    afterPaste.issueBaselines.length === 0 &&
+    afterPaste.issueExceptions.length === 0 &&
+    afterPaste.annotations.length === 0 &&
+    afterPaste.signoffView.counts.valid === 0 &&
+    afterPaste.signoffView.deleted.length === 0);
+  check('替换事务：粘贴保留用户规范词表', afterPaste.termRules.some((r) => r.id === 'old-rule'));
+  check('替换事务：粘贴是一步（不能撤到半替换态）', store.getSnapshot().canUndo === true);
+
+  // 替换后的普通编辑仍按现有粒度撤销（时代内撤销，留痕为空集合不变）
+  store.updateNodeText(afterPaste.doc.root[1].children[0].id, '新第二条被编辑。');
+  store.undo();
+  check('替换事务：替换后普通编辑单独撤销', store.getSnapshot().doc.root[1].children[0].text === '新第二条内容。');
+  check('替换事务：时代内撤销不恢复旧留痕', store.getSnapshot().snapshots.length === 0 && store.getSnapshot().issueExceptions.length === 0);
+  store.redo();
+  check('替换事务：时代内重做恢复编辑', store.getSnapshot().doc.root[1].children[0].text === '新第二条被编辑。');
+
+  // 新文档时代中产生自己的留痕：新审签、新快照
+  const newSign = store.signArticle(afterPaste.doc.root[0].id, '新审签人');
+  check('替换事务：新文档审签成功', newSign.ok && store.getSignoffView().counts.valid === 1);
+  store.saveSnapshot('新快照');
+  check('替换事务：新留痕为新文档所有', store.getSnapshot().snapshots[0]?.name === '新快照');
+
+  // —— 撤销到替换事务：整份恢复旧正文 + 旧四元组 + 旧留痕 ——
+  store.undo(); // 撤掉时代内编辑
+  store.undo(); // 跨过替换事务，落在旧时代最后一帧（第三条已被改写）
+  const backOldEdited = store.getSnapshot();
+  check('替换事务：撤销恢复旧正文末段编辑', backOldEdited.doc.root[2].children[0].text === '旧第三条被改写。');
+  check('替换事务：撤销恢复旧审签记录（条文已改时实时重算为待重签）', (() => {
+    const e = backOldEdited.signoffView.entries.find((x) => x.signoff?.signer === '旧审签人');
+    return Boolean(e) && e!.status === 'stale';
+  })());
+  // 再撤销一步到编辑前：条文与签署时一致，自动恢复有效
+  store.undo();
+  const backOld = store.getSnapshot();
+  check('替换事务：撤销替换恢复旧正文', backOld.doc.title === '旧文档办法' && backOld.doc.root.length === 3 && backOld.doc.root[2].children[0].text === '旧第三条内容。');
+  check('替换事务：撤销恢复旧批注', backOld.annotations.length === 1 && backOld.annotations[0].id === annId);
+  check('替换事务：撤销恢复旧规范规则', backOld.termRules.some((r) => r.id === 'old-rule') && !backOld.termRules.some((r) => r.canonical === '应当'));
+  check('替换事务：撤销恢复旧快照 / 基线', backOld.snapshots.length === 1 && backOld.snapshots[0].name === '旧快照' && backOld.issueBaselines.length === 1);
+  check('替换事务：撤销恢复旧审签且按旧条文有效', backOld.signoffView.counts.valid === 1 && backOld.signoffView.entries.some((e) => e.signoff?.signer === '旧审签人' && e.status === 'valid'));
+  check('替换事务：撤销恢复旧例外处置', backOld.issueExceptions.length === 1 && backOld.issueExceptions[0].reason === '旧文档接受理由');
+  check('替换事务：撤销后旧例外按当前分析仍已接受', store.getExceptionView()[0]?.status === 'accepted');
+  check('替换事务：旧正文与新文档留痕不并存', !backOld.snapshots.some((s) => s.name === '新快照') && !backOld.signoffView.entries.some((e) => e.signoff?.signer === '新审签人'));
+  check(
+    '替换事务：撤销后持久化面反映旧留痕',
+    JSON.stringify({
+      snapshots: backOld.snapshots,
+      issueBaselines: backOld.issueBaselines,
+      issueExceptions: backOld.issueExceptions,
+    }) === oldSidesJson,
+  );
+
+  // —— 重做：编辑前→编辑后→跨替换→新文档时代内编辑，整套回到新文档状态 ——
+  store.redo();
+  store.redo();
+  store.redo();
+  const backNew = store.getSnapshot();
+  check('替换事务：重做恢复新正文', backNew.doc.title === '新文档办法' && backNew.doc.root[1].children[0].text === '新第二条被编辑。');
+  check('替换事务：重做恢复新留痕', backNew.snapshots.length === 1 && backNew.snapshots[0].name === '新快照');
+  check('替换事务：重做恢复新审签', backNew.signoffView.entries.some((e) => e.signoff?.signer === '新审签人'));
+  check('替换事务：重做后旧留痕不残留', backNew.issueBaselines.length === 0 && backNew.issueExceptions.length === 0 && backNew.annotations.length === 0);
+
+  // 撤销三步回旧时代编辑前，验证 JSON 导出始终反映当前一致状态
+  store.undo();
+  store.undo();
+  store.undo();
+  const exportOld = store.exportJson();
+  check('替换事务：旧时代导出含旧留痕', exportOld.document.title === '旧文档办法' &&
+    Array.isArray(exportOld.snapshots) && exportOld.snapshots!.length === 1 &&
+    Array.isArray(exportOld.issueExceptions) && exportOld.issueExceptions!.length === 1 &&
+    (exportOld.signoffs ?? []).some((s) => s.signer === '旧审签人'));
+  void newArt1Id;
+  void oldArt1;
+  void oldArt2;
+}
+
+// ---- 整份替换事务：JSON 导入携带留痕，撤销恢复导入前整套状态 ----
+{
+  const baseText = `导入前办法
+
+第一条
+导入前内容，引用第三条。
+
+第二条
+导入前第二条。
+
+第三条
+目标条。`;
+  const baseDoc = parseDocument(baseText).doc;
+  renumberAll(baseDoc.root);
+  const store = new AppStore({ doc: baseDoc, confirmed: {}, annotations: [], termRules: [] });
+  store.saveSnapshot('导入前快照');
+  check('JSON 替换：导入前有快照', store.getSnapshot().snapshots.length === 1);
+
+  const bundle = store.exportJson();
+  // 另一份全新文档的导出包（自带快照 / 基线 / 审签 / 例外）
+  const otherText = `另一份办法
+
+第一条
+另一份第一条引用第九条断链。
+
+第二条
+另一份第二条。`;
+  const otherDoc = parseDocument(otherText).doc;
+  renumberAll(otherDoc.root);
+  const other = new AppStore({ doc: otherDoc, confirmed: {}, annotations: [], termRules: [] });
+  other.saveSnapshot('另一份快照');
+  other.saveIssueBaseline('另一份基线');
+  other.signArticle(otherDoc.root[1].id, '另一份审签人');
+  const otherBroken = other.getSnapshot().analysis.issues.find((i) => i.type === 'broken')!;
+  other.acceptIssueException(otherBroken.identity, '另一份例外理由');
+  const otherBundle = other.exportJson();
+  void bundle;
+
+  store.importJson(otherBundle);
+  const imported = store.getSnapshot();
+  check('JSON 替换：导入后为另一份正文', imported.doc.title === '另一份办法' && imported.doc.root.length === 2);
+  check('JSON 替换：导入恢复另一份全套留痕', imported.snapshots.length === 1 && imported.snapshots[0].name === '另一份快照' &&
+    imported.issueBaselines.length === 1 && imported.issueExceptions.length === 1 &&
+    imported.signoffView.entries.some((e) => e.signoff?.signer === '另一份审签人' && e.status === 'valid'));
+  check('JSON 替换：导入的例外按当前分析实时重算', store.getExceptionView()[0]?.status === 'accepted');
+
+  store.undo();
+  const restored = store.getSnapshot();
+  check('JSON 替换：撤销恢复导入前正文', restored.doc.title === '导入前办法' && restored.doc.root.length === 3);
+  check('JSON 替换：撤销恢复导入前留痕', restored.snapshots.length === 1 && restored.snapshots[0].name === '导入前快照');
+  check('JSON 替换：撤销后另一份留痕不并存', restored.issueBaselines.length === 0 && restored.issueExceptions.length === 0 && restored.signoffView.entries.every((e) => e.status === 'unsigned'));
+
+  store.redo();
+  check('JSON 替换：重做再次恢复另一份留痕', store.getSnapshot().snapshots[0]?.name === '另一份快照' && store.getSnapshot().issueExceptions.length === 1);
+}
+
+// ---- 整份替换事务：载入示例不残留旧例外处置，撤销恢复 ----
+{
+  const exText = `示例前办法
+
+第一条
+示例前引用第九条断链。
+
+第二条
+示例前第二条。`;
+  const exDoc = parseDocument(exText).doc;
+  renumberAll(exDoc.root);
+  const store = new AppStore({ doc: exDoc, confirmed: {}, annotations: [], termRules: [] });
+  const broken = store.getSnapshot().analysis.issues.find((i) => i.type === 'broken')!;
+  check('示例替换：示例前有断链', Boolean(broken));
+  store.acceptIssueException(broken.identity, '示例前理由');
+  store.signArticle(exDoc.root[1].id, '示例前审签人');
+  check('示例替换：旧留痕存在', store.getSnapshot().issueExceptions.length === 1);
+
+  store.replaceWithSample(sampleDocument());
+  check('示例替换：载入后为例示正文且旧例外不残留', store.getSnapshot().doc.title === '条款引用校验示例法' &&
+    store.getSnapshot().issueExceptions.length === 0 &&
+    store.getSnapshot().signoffView.entries.every((e) => e.status === 'unsigned') &&
+    store.getSnapshot().signoffView.deleted.length === 0 &&
+    store.getSnapshot().snapshots.length === 0 &&
+    store.getSnapshot().issueBaselines.length === 0);
+  check('示例替换：载入后自带示例规范规则', store.getSnapshot().termRules.some((r) => r.id === 'trm-sample-1'));
+
+  store.undo();
+  check('示例替换：撤销恢复示例前正文', store.getSnapshot().doc.title === '示例前办法');
+  check('示例替换：撤销恢复旧例外处置', store.getSnapshot().issueExceptions.length === 1 && store.getSnapshot().issueExceptions[0].reason === '示例前理由');
+  check('示例替换：撤销恢复旧审签', store.getSnapshot().signoffView.entries.some((e) => e.signoff?.signer === '示例前审签人'));
+  check('示例替换：撤销后示例规则不带回', !store.getSnapshot().termRules.some((r) => r.id === 'trm-sample-1'));
+  store.redo();
+  check('示例替换：重做恢复示例与清空留痕', store.getSnapshot().doc.title === '条款引用校验示例法' && store.getSnapshot().issueExceptions.length === 0);
+}
+
+// ---- 整份替换事务：跨文档撤销 / 重做使旧修订预演与引用阅读包失效 ----
+{
+  const aText = `预演办法甲
+
+第一条
+参见第二条。
+
+第二条
+内容甲二。
+
+第三条
+内容甲三。`;
+  const aDoc = parseDocument(aText).doc;
+  renumberAll(aDoc.root);
+  const store = new AppStore({ doc: aDoc, confirmed: {}, annotations: [], termRules: [] });
+
+  // 旧文档上生成预演与阅读包
+  check('跨文档失效：旧预演可生成', store.runSandboxPreview({ kind: 'delete', articleId: aDoc.root[2].id }).ok);
+  check('跨文档失效：旧阅读包可生成', store.generateReadingPack(aDoc.root[0].id).ok);
+  check('跨文档失效：替换前均未失效', store.getSnapshot().sandboxStale === false && store.getSnapshot().readingPackStale === false);
+
+  const bText = `预演办法乙
+
+第一条
+乙文档第一条。
+
+第二条
+乙文档第二条。`;
+  store.importPastedText(bText);
+  const bDoc = store.getSnapshot().doc;
+  check('跨文档失效：替换后预演 / 阅读包清空', store.getSnapshot().sandbox === null && store.getSnapshot().readingPack === null);
+  check('跨文档失效：替换后无预演可应用', store.applySandboxPreview() === false);
+
+  // 撤销回旧文档：旧预演与旧阅读包已被作废，不能应用 / 复制
+  store.undo();
+  check('跨文档失效：撤销跨文档后旧预仍作废', store.getSnapshot().sandbox === null);
+  check('跨文档失效：撤销跨文档后旧阅读包作废', store.getSnapshot().readingPack === null);
+
+  // 在旧文档重新生成，再重做跨文档：同样作废
+  check('跨文档失效：重新生成预演', store.runSandboxPreview({ kind: 'delete', articleId: aDoc.root[2].id }).ok);
+  check('跨文档失效：重新生成阅读包', store.generateReadingPack(aDoc.root[0].id).ok);
+  store.redo();
+  check('跨文档失效：重做跨文档后正文为乙文档', store.getSnapshot().doc.title === '预演办法乙' && store.getSnapshot().doc.root.length === 2);
+  check('跨文档失效：重做跨文档后预演作废不可应用', store.getSnapshot().sandbox === null && store.applySandboxPreview() === false);
+  check('跨文档失效：重做跨文档后阅读包作废', store.getSnapshot().readingPack === null);
+  void bDoc;
+
+  // 时代内（同文档）撤销 / 重做：旧预演因正文版本号变化标记失效，禁止应用
+  const cText = `同文档撤销办法
+
+第一条
+同文档内容引用第二条。
+
+第二条
+同文档第二条。`;
+  const cDoc = parseDocument(cText).doc;
+  renumberAll(cDoc.root);
+  const store2 = new AppStore({ doc: cDoc, confirmed: {}, annotations: [], termRules: [] });
+  store2.runSandboxPreview({ kind: 'delete', articleId: cDoc.root[1].id });
+  store2.generateReadingPack(cDoc.root[0].id);
+  store2.updateNodeText(cDoc.root[1].children[0].id, '同文档第二条被改。');
+  store2.undo();
+  // 撤销回到生成预演时的正文：版本号仍比生成时新（单调递增），预演保持失效
+  check('同文档撤销：撤销后旧预演标记失效', store2.getSnapshot().sandboxStale === true);
+  check('同文档撤销：失效预演禁止应用', store2.applySandboxPreview() === false);
+  check('同文档撤销：旧阅读包标记失效、禁止复制', store2.getSnapshot().readingPackStale === true);
 }
 
 console.log(`\n通过 ${pass} 项，失败 ${fail} 项`);

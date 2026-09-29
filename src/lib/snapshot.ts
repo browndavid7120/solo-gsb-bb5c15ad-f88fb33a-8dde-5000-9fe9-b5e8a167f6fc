@@ -72,10 +72,12 @@ export function sanitizeSnapshots(value: unknown): DocSnapshot[] {
     if (!raw || typeof raw !== 'object') continue;
     const s = raw as Partial<DocSnapshot>;
     if (!s.doc || !Array.isArray(s.doc.root) || typeof s.doc.title !== 'string') continue;
+    // 深拷贝后再规范化序号：导入包中的快照（如同一进程内往返导出）可能已被只读冻结，
+    // 直接 renumberAll 会写入冻结对象抛错；深拷贝同时保证快照与导入数据脱离引用关系
     const doc: ClauseDocument = {
       id: typeof s.doc.id === 'string' ? s.doc.id : uid('doc'),
       title: s.doc.title,
-      root: s.doc.root,
+      root: deepClone(s.doc.root),
       updatedAt: typeof s.doc.updatedAt === 'number' ? s.doc.updatedAt : 0,
     };
     renumberAll(doc.root);

@@ -74,6 +74,30 @@ interface DocState {
   termRules: TermRule[];
 }
 
+/**
+ * 文档级留痕（快照、问题基线、审签、例外处置）：各自独立持久化，
+ * 不随普通编辑撤销；但整份文档替换（粘贴 / JSON 导入 / 载入示例）会切换整套留痕，
+ * 并作为一次完整历史事务参与撤销 / 重做——故每个历史帧记录该帧所属时代的留痕快照。
+ */
+interface SideState {
+  snapshots: DocSnapshot[];
+  issueBaselines: IssueBaseline[];
+  signoffs: ArticleSignoff[];
+  issueExceptions: IssueException[];
+}
+
+/**
+ * 历史帧：正文四元组 + 该帧所处时代的文档级留痕。
+ * 同一文档内的连续编辑共享同一份留痕引用（签署 / 例外等留痕在时代内实时重算）；
+ * 整份替换产生新的留痕对象与新的时代 id，撤销 / 重做跨过替换边界时整份切换。
+ */
+interface HistoryFrame {
+  state: DocState;
+  sides: SideState;
+  /** 时代身份：同一份文档的连续编辑共享；整份替换开启新时代 */
+  era: number;
+}
+
 interface Snapshot {
   doc: ClauseDocument;
   confirmed: Record<string, string>;
@@ -105,15 +129,11 @@ interface Snapshot {
 const MAX_HISTORY = 100;
 
 export class AppStore {
-  private past: DocState[] = [];
-  private future: DocState[] = [];
+  private past: HistoryFrame[] = [];
+  private future: HistoryFrame[] = [];
   private docState: DocState;
-  private snapshots: DocSnapshot[] = [];
-  private issueBaselines: IssueBaseline[] = [];
-  /** 条款审签记录（独立于正文撤销历史；有效 / 待重签按当前条文实时重算） */
-  private signoffs: ArticleSignoff[] = [];
-  /** 断链 / 自引用问题的例外处置记录（独立于撤销历史；已接受 / 待复核 / 已消失按当前分析实时重算） */
-  private issueExceptions: IssueException[] = [];
+  /** 当前时代的文档级留痕（随时代内签署 / 例外等操作就地更新并同步到同代历史帧） */
+  private sides: SideState;
   private analysis: Analysis;
   /** 当前规范用语命中（随 docState 实时重算，不进入撤销历史） */
   private termHits: TermHit[] = [];
@@ -132,14 +152,17 @@ export class AppStore {
   private readingPack: ReadingPack | null = null;
   /** 正文版本号：仅当正文文档对象变化时递增（批注 / 规范规则 / 歧义确认不变更正文） */
   private docRevision = 0;
+  /** 当前时代 id：整份文档替换（粘贴 / JSON 导入 / 载入示例）开启新时代 */
+  private era = 0;
 
   constructor(initial: PersistedState) {
-    this.snapshots = sanitizeSnapshots(initial.snapshots);
-    this.issueBaselines = sanitizeIssueBaselines(initial.issueBaselines);
+    const snapshots = sanitizeSnapshots(initial.snapshots);
+    const issueBaselines = sanitizeIssueBaselines(initial.issueBaselines);
     // 审签记录随本地存储 / JSON 加载；旧数据缺少 signoffs 时按空列表加载
-    this.signoffs = sanitizeSignoffs(initial.signoffs);
+    const signoffs = sanitizeSignoffs(initial.signoffs);
     // 例外处置记录随本地存储 / JSON 加载；旧数据缺少 issueExceptions 时按空列表加载
-    this.issueExceptions = sanitizeIssueExceptions(initial.issueExceptions);
+    const issueExceptions = sanitizeIssueExceptions(initial.issueExceptions);
+    this.sides = { snapshots, issueBaselines, signoffs, issueExceptions };
     const annotations = sanitizeAnnotations(initial.annotations);
     const termRules = sanitizeTermRules(initial.termRules);
     const doc = initial.doc;
@@ -164,8 +187,8 @@ export class AppStore {
     confirmed: this.docState.confirmed,
     annotations: this.docState.annotations,
     termRules: this.docState.termRules,
-    snapshots: this.snapshots,
-    issueBaselines: this.issueBaselines,
+    snapshots: this.sides.snapshots,
+    issueBaselines: this.sides.issueBaselines,
     analysis: this.analysis,
     termHits: this.termHits,
     sandbox: this.sandbox,
@@ -174,9 +197,9 @@ export class AppStore {
     readingPackStale: this.readingPack
       ? isReadingPackStale(this.readingPack, this.docRevision, this.docState.confirmed)
       : false,
-    signoffView: buildSignoffView(this.docState.doc, this.signoffs),
-    issueExceptions: this.issueExceptions,
-    exceptionView: buildIssueExceptionView(this.analysis, this.issueExceptions),
+    signoffView: buildSignoffView(this.docState.doc, this.sides.signoffs),
+    issueExceptions: this.sides.issueExceptions,
+    exceptionView: buildIssueExceptionView(this.analysis, this.sides.issueExceptions),
     canUndo: this.past.length > 0,
     canRedo: this.future.length > 0,
   });
@@ -185,11 +208,28 @@ export class AppStore {
   private currentPersisted(): PersistedState {
     return {
       ...this.docState,
-      snapshots: this.snapshots,
-      issueBaselines: this.issueBaselines,
-      signoffs: this.signoffs,
-      issueExceptions: this.issueExceptions,
+      snapshots: this.sides.snapshots,
+      issueBaselines: this.sides.issueBaselines,
+      signoffs: this.sides.signoffs,
+      issueExceptions: this.sides.issueExceptions,
     };
+  }
+
+  /**
+   * 更新当前时代的文档级留痕（签署 / 例外 / 快照 / 基线的增删改）。
+   * 仅同步同一时代 id 的历史帧（含撤销栈 / 重做栈中暂存的同代帧），
+   * 使时代内撤销 / 重做始终看到留痕的最新形态；其他时代（整份替换前 / 后
+   * 的另一文档）的帧即使恰与当前留痕同引用（重做态）也绝不被改写。
+   */
+  private patchSides(patch: Partial<SideState>): void {
+    const prev = this.sides;
+    const next = { ...prev, ...patch };
+    this.sides = next;
+    for (const list of [this.past, this.future]) {
+      for (const f of list) {
+        if (f.era === this.era && f.sides === prev) f.sides = next;
+      }
+    }
   }
 
   /** 提交新状态：重新分析、批注自动重定位、裁剪过期确认、规范用语重扫、压入历史、持久化 */
@@ -222,13 +262,13 @@ export class AppStore {
         // 同一编辑突发内：不压栈，栈顶保持为突发前基线
       } else {
         this.coalesceBaseline = this.docState;
-        this.past.push(this.docState);
+        this.past.push({ state: this.docState, sides: this.sides, era: this.era });
       }
     } else {
       this.coalesceBaseline = null;
       this.editCoalesceUntil = 0;
       this.ruleCoalesceUntil = 0;
-      this.past.push(this.docState);
+      this.past.push({ state: this.docState, sides: this.sides, era: this.era });
       if (this.past.length > MAX_HISTORY) this.past.shift();
     }
     this.future = [];
@@ -239,6 +279,63 @@ export class AppStore {
     this.lastAnnotationReviewCount = options.structural ? relocated.reviewIds.length : 0;
     this.scheduleSave();
     this.emit();
+  }
+
+  /**
+   * 整份文档替换事务（粘贴替换 / JSON 导入 / 载入示例）：
+   * 旧正文四元组连同旧时代的完整留痕压入 past；新正文与新留痕作为当前时代；
+   * 重做栈清空。撤销本事务时整体恢复替换前的正文、歧义确认、批注、规范用语规则
+   * 与快照、问题基线、审签、例外处置；重做则整体恢复替换后的整套状态。
+   * 替换后再做的普通编辑仍按既有粒度撤销（同代帧共享留痕引用）。
+   * 基于旧正文的会话内临时产物（修订预演、引用阅读包）随替换失效清空。
+   */
+  private commitReplacement(next: DocState, nextSides: SideState): void {
+    const prepared = this.prepareDocState(next);
+    this.coalesceBaseline = null;
+    this.editCoalesceUntil = 0;
+    this.ruleCoalesceUntil = 0;
+    this.past.push({ state: this.docState, sides: this.sides, era: this.era });
+    if (this.past.length > MAX_HISTORY) this.past.shift();
+    this.future = [];
+    this.docState = prepared.state;
+    this.sides = nextSides;
+    // 整份替换开启全新时代：之后的留痕更新只作用于新时代帧，绝不能改写旧文档留痕
+    this.era += 1;
+    this.docRevision += 1;
+    this.analysis = prepared.analysis;
+    this.termHits = prepared.termHits;
+    this.lastAnnotationReviewCount = 0;
+    this.lastTermReplace = null;
+    this.sandbox = null;
+    this.readingPack = null;
+    this.scheduleSave();
+    this.emit();
+  }
+
+  /** 提交前统一处理：批注重定位、过期确认裁剪、正文 touch、规范用语重扫 */
+  private prepareDocState(next: DocState): {
+    state: DocState;
+    analysis: Analysis;
+    termHits: TermHit[];
+  } {
+    const analysis = analyze(next.doc, { confirmed: next.confirmed });
+    const relocated = relocateAnnotations(next.annotations, next.doc);
+    const valid = new Set(
+      analysis.occurrences
+        .filter((o) => o.signature && next.confirmed[o.signature])
+        .map((o) => o.signature),
+    );
+    const confirmed: Record<string, string> = {};
+    for (const [sig, target] of Object.entries(next.confirmed)) {
+      if (valid.has(sig) && analysis.nodes[target]) confirmed[sig] = target;
+    }
+    const state: DocState = {
+      confirmed,
+      doc: touch(next.doc),
+      annotations: relocated.annotations,
+      termRules: next.termRules,
+    };
+    return { state, analysis, termHits: scanTerms(state.doc, state.termRules) };
   }
 
   private scheduleSave(): void {
@@ -254,16 +351,28 @@ export class AppStore {
   undo(): void {
     const prev = this.past.pop();
     if (!prev) return;
-    if (prev.doc !== this.docState.doc) this.docRevision += 1;
-    this.future.push(this.docState);
-    this.docState = prev;
-    this.analysis = analyze(prev.doc, { confirmed: prev.confirmed });
-    this.termHits = scanTerms(prev.doc, prev.termRules);
+    if (prev.state.doc !== this.docState.doc) this.docRevision += 1;
+    // 当前帧（含当前时代留痕的最新形态）进入重做栈
+    this.future.push({ state: this.docState, sides: this.sides, era: this.era });
+    // 是否跨过整份文档替换边界（旧 / 新文档属于不同时代）
+    const crossedEra = prev.era !== this.era;
+    this.docState = prev.state;
+    // 跨整份替换边界时切换到替换前文档的整套留痕与时代；时代内撤销则留痕保持实时重算形态
+    this.sides = prev.sides;
+    this.era = prev.era;
+    this.analysis = analyze(prev.state.doc, { confirmed: prev.state.confirmed });
+    this.termHits = scanTerms(prev.state.doc, prev.state.termRules);
     this.coalesceBaseline = null;
     this.editCoalesceUntil = 0;
     this.ruleCoalesceUntil = 0;
     this.lastAnnotationReviewCount = 0;
     this.lastTermReplace = null;
+    if (crossedEra) {
+      // 跨文档撤销后旧修订预演 / 引用阅读包一律作废，禁止应用 / 复制；
+      // 时代内撤销不清空——正文版本号已变，按既有语义保留并标记失效
+      this.sandbox = null;
+      this.readingPack = null;
+    }
     this.scheduleSave();
     this.emit();
   }
@@ -271,16 +380,25 @@ export class AppStore {
   redo(): void {
     const next = this.future.pop();
     if (!next) return;
-    if (next.doc !== this.docState.doc) this.docRevision += 1;
-    this.past.push(this.docState);
-    this.docState = next;
-    this.analysis = analyze(next.doc, { confirmed: next.confirmed });
-    this.termHits = scanTerms(next.doc, next.termRules);
+    if (next.state.doc !== this.docState.doc) this.docRevision += 1;
+    const crossedEra = next.era !== this.era;
+    this.past.push({ state: this.docState, sides: this.sides, era: this.era });
+    this.docState = next.state;
+    // 跨整份替换边界时恢复替换后文档的整套留痕与时代
+    this.sides = next.sides;
+    this.era = next.era;
+    this.analysis = analyze(next.state.doc, { confirmed: next.state.confirmed });
+    this.termHits = scanTerms(next.state.doc, next.state.termRules);
     this.coalesceBaseline = null;
     this.editCoalesceUntil = 0;
     this.ruleCoalesceUntil = 0;
     this.lastAnnotationReviewCount = 0;
     this.lastTermReplace = null;
+    if (crossedEra) {
+      // 跨文档重做同样使旧预演 / 旧阅读包作废
+      this.sandbox = null;
+      this.readingPack = null;
+    }
     this.scheduleSave();
     this.emit();
   }
@@ -419,15 +537,17 @@ export class AppStore {
   importPastedText(raw: string): void {
     const { doc } = parseDocument(raw, this.docState.doc.title);
     // 粘贴替换正文是全新文档，旧快照、问题基线、审签与批注不再有对齐意义；规范用语规则是用户词表，予以保留
-    this.snapshots = [];
-    this.issueBaselines = [];
-    this.signoffs = [];
-    // 例外处置绑定旧文档的稳定问题身份，新文档下一并清空
-    this.issueExceptions = [];
-    // 会话内临时产物（沙盒预演、引用阅读包）基于旧正文，新文档下一律清空
-    this.sandbox = null;
-    this.readingPack = null;
-    this.commit({ doc, confirmed: {}, annotations: [], termRules: this.docState.termRules });
+    // 整套清空作为替换后时代的留痕，随撤销整体恢复旧文档留痕、随重做再清空（见 commitReplacement）
+    const nextSides: SideState = {
+      snapshots: [],
+      issueBaselines: [],
+      signoffs: [],
+      issueExceptions: [],
+    };
+    this.commitReplacement(
+      { doc, confirmed: {}, annotations: [], termRules: this.docState.termRules },
+      nextSides,
+    );
   }
 
   importJson(bundle: ExportBundle | PersistedState): void {
@@ -440,19 +560,23 @@ export class AppStore {
     };
     const confirmed = bundle.confirmed ?? {};
     // 快照随 JSON 导入；旧文件缺少 snapshots 时按空列表加载
-    this.snapshots = sanitizeSnapshots(bundle.snapshots);
+    const snapshots = sanitizeSnapshots(bundle.snapshots);
     // 问题基线随 JSON 导入（重新分析重建问题身份）；旧文件缺少 issueBaselines 时按空列表加载
-    this.issueBaselines = sanitizeIssueBaselines(bundle.issueBaselines);
+    const issueBaselines = sanitizeIssueBaselines(bundle.issueBaselines);
     // 批注随 JSON 导入并按导入后的正文重定位；旧文件缺少 annotations 时为空
     const annotations = sanitizeAnnotations(bundle.annotations);
     // 规范用语规则随 JSON 导入；旧文件缺少 termRules 时按空规则加载
     const termRules = sanitizeTermRules(bundle.termRules);
     // 审签记录随 JSON 导入；旧文件缺少 signoffs 时按空列表加载，有效 / 待重签按导入正文实时重算
-    this.signoffs = sanitizeSignoffs(bundle.signoffs);
+    const signoffs = sanitizeSignoffs(bundle.signoffs);
     // 例外处置记录随 JSON 导入；旧文件缺少 issueExceptions 时按空列表加载，已接受 / 待复核 / 已消失按导入正文实时重算
-    this.issueExceptions = sanitizeIssueExceptions(bundle.issueExceptions);
+    const issueExceptions = sanitizeIssueExceptions(bundle.issueExceptions);
     renumberAll(doc.root);
-    this.commit({ doc: touch(doc), confirmed, annotations, termRules });
+    // JSON 导入同样是一次完整历史事务：撤销恢复导入前的整套文档与留痕
+    this.commitReplacement(
+      { doc: touch(doc), confirmed, annotations, termRules },
+      { snapshots, issueBaselines, signoffs, issueExceptions },
+    );
   }
 
   exportJson(): ExportBundle {
@@ -461,30 +585,34 @@ export class AppStore {
       version: 1,
       document: this.docState.doc,
       confirmed: this.docState.confirmed,
-      snapshots: this.snapshots,
-      issueBaselines: this.issueBaselines,
+      snapshots: this.sides.snapshots,
+      issueBaselines: this.sides.issueBaselines,
       annotations: this.docState.annotations,
       termRules: this.docState.termRules,
-      signoffs: this.signoffs,
-      issueExceptions: this.issueExceptions,
+      signoffs: this.sides.signoffs,
+      issueExceptions: this.sides.issueExceptions,
       exportedAt: new Date().toISOString(),
     };
   }
 
   replaceWithSample(doc: ClauseDocument): void {
-    this.snapshots = [];
-    this.issueBaselines = [];
-    // 内置示例为全新文档，旧审签记录不再适用
-    this.signoffs = [];
-    // 例外处置绑定旧文档的稳定问题身份，内置示例下一并清空
-    this.issueExceptions = [];
+    // 内置示例为全新文档，旧快照、问题基线、审签与例外处置不再适用，随替换事务整体切换
+    const nextSides: SideState = {
+      snapshots: [],
+      issueBaselines: [],
+      signoffs: [],
+      issueExceptions: [],
+    };
     // 内置示例自带示例规则（见 sampleTermRules），同时保留用户已维护的词表
-    this.commit({
-      doc,
-      confirmed: {},
-      annotations: [],
-      termRules: [...sampleTermRules(), ...this.docState.termRules],
-    });
+    this.commitReplacement(
+      {
+        doc,
+        confirmed: {},
+        annotations: [],
+        termRules: [...sampleTermRules(), ...this.docState.termRules],
+      },
+      nextSides,
+    );
   }
 
   // ---------- 版本快照（只读；创建/删除不进入正文撤销历史） ----------
@@ -495,11 +623,11 @@ export class AppStore {
     const snapshot = createSnapshot(
       this.docState.doc,
       this.docState.confirmed,
-      trimmed || defaultSnapshotName(this.snapshots.length),
+      trimmed || defaultSnapshotName(this.sides.snapshots.length),
       this.docState.annotations,
       this.docState.termRules,
     );
-    this.snapshots = [...this.snapshots, snapshot];
+    this.patchSides({ snapshots: [...this.sides.snapshots, snapshot] });
     this.scheduleSave();
     this.emit();
     return snapshot.id;
@@ -507,8 +635,10 @@ export class AppStore {
 
   /** 删除快照：不影响正文、确认记录与撤销历史 */
   deleteSnapshot(snapshotId: string): void {
-    if (!this.snapshots.some((s) => s.id === snapshotId)) return;
-    this.snapshots = this.snapshots.filter((s) => s.id !== snapshotId);
+    if (!this.sides.snapshots.some((s) => s.id === snapshotId)) return;
+    this.patchSides({
+      snapshots: this.sides.snapshots.filter((s) => s.id !== snapshotId),
+    });
     this.scheduleSave();
     this.emit();
   }
@@ -521,9 +651,9 @@ export class AppStore {
     const baseline = createIssueBaseline(
       this.docState.doc,
       this.docState.confirmed,
-      trimmed || defaultBaselineName(this.issueBaselines.length),
+      trimmed || defaultBaselineName(this.sides.issueBaselines.length),
     );
-    this.issueBaselines = [...this.issueBaselines, baseline];
+    this.patchSides({ issueBaselines: [...this.sides.issueBaselines, baseline] });
     this.scheduleSave();
     this.emit();
     return baseline.id;
@@ -531,8 +661,10 @@ export class AppStore {
 
   /** 删除问题基线：仅移除基线本身，不影响正文、确认记录、批注、规则与撤销历史 */
   deleteIssueBaseline(baselineId: string): void {
-    if (!this.issueBaselines.some((b) => b.id === baselineId)) return;
-    this.issueBaselines = this.issueBaselines.filter((b) => b.id !== baselineId);
+    if (!this.sides.issueBaselines.some((b) => b.id === baselineId)) return;
+    this.patchSides({
+      issueBaselines: this.sides.issueBaselines.filter((b) => b.id !== baselineId),
+    });
     this.scheduleSave();
     this.emit();
   }
@@ -551,12 +683,11 @@ export class AppStore {
     if (!article || article.kind !== 'article') {
       return { ok: false, error: '条款不存在或已删除' };
     }
-    const existing = this.signoffs.find((s) => s.articleId === articleId);
+    const existing = this.sides.signoffs.find((s) => s.articleId === articleId);
     const record = signArticle(existing, articleId, name, articleFingerprint(article));
-    this.signoffs = [
-      ...this.signoffs.filter((s) => s.articleId !== articleId),
-      record,
-    ];
+    this.patchSides({
+      signoffs: [...this.sides.signoffs.filter((s) => s.articleId !== articleId), record],
+    });
     this.scheduleSave();
     this.emit();
     return { ok: true };
@@ -564,7 +695,7 @@ export class AppStore {
 
   /** 当前审签汇总（供面板与徽标使用；已删除条记录单列、不计入统计） */
   getSignoffView(): SignoffView {
-    return buildSignoffView(this.docState.doc, this.signoffs);
+    return buildSignoffView(this.docState.doc, this.sides.signoffs);
   }
 
   // ---------- 断链 / 自引用问题的例外处置（独立持久化，不进入撤销历史；状态按当前分析实时重算） ----------
@@ -582,10 +713,12 @@ export class AppStore {
     );
     if (!issue) return { ok: false, error: '该问题已不存在，无法接受例外' };
     const record = acceptIssueException(issue, this.analysis, trimmed);
-    this.issueExceptions = [
-      ...this.issueExceptions.filter((r) => r.identity !== identity),
-      record,
-    ];
+    this.patchSides({
+      issueExceptions: [
+        ...this.sides.issueExceptions.filter((r) => r.identity !== identity),
+        record,
+      ],
+    });
     this.scheduleSave();
     this.emit();
     return { ok: true };
@@ -596,7 +729,7 @@ export class AppStore {
    * 仅当身份仍在当前问题集合（已接受 / 待复核）时允许；已消失的记录须先在「已消失」区处理。
    */
   reconfirmIssueException(identity: string, reason: string): { ok: boolean; error?: string } {
-    const current = this.issueExceptions.find((r) => r.identity === identity);
+    const current = this.sides.issueExceptions.find((r) => r.identity === identity);
     if (!current) return { ok: false, error: '例外处置记录不存在' };
     const trimmed = reason.trim();
     if (!trimmed) return { ok: false, error: '请填写接受例外的理由' };
@@ -605,7 +738,11 @@ export class AppStore {
     );
     if (!issue) return { ok: false, error: '问题已消失，无法重新确认' };
     const record = reconfirmIssueException(current, issue, this.analysis, trimmed);
-    this.issueExceptions = this.issueExceptions.map((r) => (r.identity === identity ? record : r));
+    this.patchSides({
+      issueExceptions: this.sides.issueExceptions.map((r) =>
+        r.identity === identity ? record : r,
+      ),
+    });
     this.scheduleSave();
     this.emit();
     return { ok: true };
@@ -613,23 +750,27 @@ export class AppStore {
 
   /** 撤销处置：删除该例外记录，问题恢复为未处置（不改正文、不进入撤销历史） */
   revokeIssueException(identity: string): void {
-    if (!this.issueExceptions.some((r) => r.identity === identity)) return;
-    this.issueExceptions = this.issueExceptions.filter((r) => r.identity !== identity);
+    if (!this.sides.issueExceptions.some((r) => r.identity === identity)) return;
+    this.patchSides({
+      issueExceptions: this.sides.issueExceptions.filter((r) => r.identity !== identity),
+    });
     this.scheduleSave();
     this.emit();
   }
 
   /** 删除已消失问题的例外留痕（仅清理记录，不影响正文） */
   deleteIssueException(recordId: string): void {
-    if (!this.issueExceptions.some((r) => r.id === recordId)) return;
-    this.issueExceptions = this.issueExceptions.filter((r) => r.id !== recordId);
+    if (!this.sides.issueExceptions.some((r) => r.id === recordId)) return;
+    this.patchSides({
+      issueExceptions: this.sides.issueExceptions.filter((r) => r.id !== recordId),
+    });
     this.scheduleSave();
     this.emit();
   }
 
   /** 当前例外处置逐条判定（供面板筛选与标记；已接受 / 待复核 / 已消失按当前分析实时重算） */
   getExceptionView(): IssueExceptionEntry[] {
-    return buildIssueExceptionView(this.analysis, this.issueExceptions);
+    return buildIssueExceptionView(this.analysis, this.sides.issueExceptions);
   }
 
   // ---------- 修订沙盒（会话内预演：在文档克隆上复用结构改写与分析，不改动正文与撤销历史） ----------
